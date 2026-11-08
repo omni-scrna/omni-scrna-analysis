@@ -190,7 +190,10 @@ def node_dirs(root: Path) -> list[str]:
     dirs are dotted too, but only ever below a stage."""
     return sorted({str(f.parent)
                    for top in root.iterdir()
+                   # human/ (ob >= 0.8) mirrors the tree with symlinked files:
+                   # walking it would emit every node twice.
                    if top.is_dir() and not top.name.startswith(".")
+                   and top.name != "human"
                    for pattern in ("**/*performance.txt", "**/*metrics.json")
                    for f in top.glob(pattern)})
 
