@@ -87,6 +87,42 @@ def build(root: Path) -> None:
 def test_lineage_of():
     assert lineage_of(Path("DATA/be1/.f612184b")) == [("DATA", "be1", "f612184b")]
     assert lineage_of(Path("DATA/be1")) == []  # not a whole triple
+    # flat (api >= 0.8): one segment per node, a join digest kept in the hash
+    assert lineage_of(Path("DATA.be1.f612184b/GRAPH_G.ls.099b3753-4ce8aa43")) == [
+        ("DATA", "be1", "f612184b"), ("GRAPH_G", "ls", "099b3753-4ce8aa43")]
+    assert lineage_of(Path("DATA.be1.f612184b/v1.0.0")) == []  # template subdir
+
+
+def test_collect_flat_tree(tmp_path):
+    """api >= 0.8: flat segments, `_M` metric stages, a human/ view to skip."""
+    meta = tmp_path / ".metadata"
+    meta.mkdir()
+    (meta / "manifest.json").write_text(json.dumps({"run_id": "r", "hostname": "x"}))
+    (meta / "benchmark.yaml").write_text("""
+stages:
+  - {id: DATA, outputs: [{id: truth}], modules: [{id: be1, repository: {url: u, commit: 1606435}}]}
+  - {id: NNG, inputs: [truth], modules: [{id: nn, repository: {url: u, commit: c}}]}
+  - {id: GRAPH_M, inputs: [graph, truth], modules: [{id: gm, repository: {url: u, commit: c}}]}
+""")
+    data = tmp_path / "DATA.be1.f612184b"
+    nng = data / "NNG.nn.93185a35"
+    gm = nng / "GRAPH_M.gm.default"
+    gm.mkdir(parents=True)
+    for d in (data, nng):
+        (d / "performance.txt").write_text(PERF)
+    (nng / "parameters.json").write_text('{"n_neighbors": 15}')
+    (gm / "gm_graph_metrics.json").write_text(json.dumps({"NP": 0.97}))
+    human = tmp_path / "human" / "DATA.be1.default"
+    human.mkdir(parents=True)
+    (human / "performance.txt").symlink_to(data / "performance.txt")
+
+    df = collect(tmp_path, processes=1)
+    rows = {r["stage"]: r for r in df.iter_rows(named=True)}
+    assert df.height == 3 and set(rows) == {"DATA", "NNG", "GRAPH_M"}
+    g = rows["GRAPH_M"]
+    assert (g["kind"], g["evaluates"], g["evaluates_method"]) == ("metric", "NNG", "nn")
+    assert g["NNG_n_neighbors"] == 15 and g["NP"] == 0.97
+    assert rows["DATA"]["commit"] == "1606435"  # an all-digit SHA stays a string
 
 
 def test_read_modules(tmp_path):

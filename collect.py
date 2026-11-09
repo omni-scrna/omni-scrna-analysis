@@ -5,14 +5,14 @@
 # ///
 """Collect one omnibenchmark run tree (an `out/` folder) into a flat table.
 
-One row per node, where a node is a `STAGE/method/.param_hash` triple in the
-output tree. Everything about that node is a column: its identity, its
+One row per node: a `STAGE/method/.param_hash` triple in a nested tree (api
+< 0.8), or one `STAGE.module.param[-join]` segment in a flat one (api >= 0.8). Everything about that node is a column: its identity, its
 parameters, its metrics, and its snakemake resource counters.
 
     ./collect.py ../split-stages-plan/out --csv
 
-Stage ids ending in `-M` are metric stages (EMBED-M, GRAPH-M, CLUST-M); the
-rest are methods. A metric node scores the method directly above it, named in
+Stage ids ending in `-M` (or `_M`, as 0.8 ids cannot hold `-`) are metric
+stages (EMBED-M, CLUST-M, GRAPH_M); the rest are methods. A metric node scores the method directly above it, named in
 `evaluates` / `evaluates_method`. Every node also carries its whole lineage as
 `{STAGE}_module` and `{STAGE}_{param}` columns, so a row is self-describing:
 the EMBED-M row holding a silhouette also holds the PCA solver that earned it.
@@ -58,17 +58,37 @@ def read_modules(meta: Path) -> dict[str, dict]:
     return out
 
 
+# A flat (api >= 0.8) node segment, ob's grammar (007 §3.1.1):
+# stage.module[.group].param[-join]; ids cannot contain `.` or `-`.
+_ID = r"[A-Za-z_][A-Za-z0-9_]*"
+FLAT_SEGMENT = re.compile(
+    rf"({_ID})\.({_ID})(?:\.{_ID})?\.(default|[0-9a-f]{{8}})(-[0-9a-f]{{8}})?")
+
+
 def lineage_of(rel: Path) -> list[tuple[str, str, str]]:
     """Out-relative node dir -> [(stage, method, param_hash), ...].
 
-    The tree alternates STAGE / method / .hash all the way down, so the parts
-    come in threes; anything else is not a node.
+    Nested tree: STAGE / method / .hash all the way down, parts in threes.
+    Flat tree: every part is one node segment. Anything else is not a node.
+    The hash keeps a join digest as `param-join`, in both layouts.
     """
     parts = rel.parts
+    flat = [FLAT_SEGMENT.fullmatch(p) for p in parts]
+    if parts and all(flat):
+        return [(m[1], m[2], m[3] + (m[4] or "")) for m in flat]
     if not parts or len(parts) % 3:
         return []
     return [(parts[i], parts[i + 1], parts[i + 2].lstrip("."))
             for i in range(0, len(parts), 3)]
+
+
+def parts_per_node(rel: Path) -> int:
+    """1 in a flat tree, 3 in a nested one."""
+    return 1 if FLAT_SEGMENT.fullmatch(rel.parts[0]) else 3
+
+
+def is_metric_stage(stage: str) -> bool:
+    return stage.endswith(("-M", "_M"))
 
 
 def as_float(text: str) -> float | None:
@@ -123,8 +143,9 @@ def node_row(job: tuple[str, str]) -> dict | None:
     # Ancestor dirs are prefixes of ours, so their parameters.json is one read
     # away. Flattening them here is what makes a metric row self-describing.
     lineage = {}
+    span = parts_per_node(rel)
     for depth, (s, m, _) in enumerate(chain, start=1):
-        ancestor = Path(root).joinpath(*rel.parts[:depth * 3])
+        ancestor = Path(root).joinpath(*rel.parts[:depth * span])
         # Three separate namespaces. Sharing one silently loses data whenever a
         # module declares a parameter named like the identity or a derived fact:
         # cl-rapids declares `method: rapids-leiden`, which used to overwrite its
@@ -138,7 +159,7 @@ def node_row(job: tuple[str, str]) -> dict | None:
     # the method stage directly above them. Runs that don't follow the
     # convention get these three columns blanked in collect() -- null means
     # "unknown", which beats calling a metric stage a method.
-    is_metric = stage.endswith("-M")
+    is_metric = is_metric_stage(stage)
     parent = chain[-2] if is_metric and len(chain) > 1 else None
     row = {
         "node": str(rel),
@@ -201,7 +222,7 @@ def collect(root: Path, processes: int | None = None) -> pl.DataFrame:
     # place in the DAG. Say so rather than dropping it quietly.
     if skipped := len(jobs) - len(rows):
         print(f"warning: {skipped} of {len(jobs)} results dirs are not "
-              f"STAGE/method/.hash triples and were skipped")
+              f"nodes (STAGE/method/.hash or STAGE.module.param) and were skipped")
 
     run_id = manifest["run_id"]
     key = pl.concat_str("stage", "method", separator="/")
@@ -217,7 +238,9 @@ def collect(root: Path, processes: int | None = None) -> pl.DataFrame:
             ob_version=pl.lit(manifest.get("ob_version")),
             hostname=pl.lit(manifest.get("hostname")),
             commit=key.replace_strict(
-                {k: v.get("commit") for k, v in modules.items()}, default=None),
+                # str(): YAML reads an all-digit SHA (1606435) as an int
+                {k: None if v.get("commit") is None else str(v["commit"])
+                 for k, v in modules.items()}, default=None),
             repo=key.replace_strict(
                 {k: v.get("repo") for k, v in modules.items()}, default=None),
         )
@@ -227,8 +250,8 @@ def collect(root: Path, processes: int | None = None) -> pl.DataFrame:
     # `kind`/`evaluates` mean nothing if this benchmark doesn't use the `-M`
     # suffix (out_ci spells it `cluster-metrics`). Blank them rather than
     # labelling every metric stage a method.
-    if not df["stage"].str.ends_with("-M").any():
-        print("warning: no stage id ends in '-M'; leaving kind/evaluates empty")
+    if not df["stage"].str.contains(r"[-_]M$").any():
+        print("warning: no stage id ends in '-M' or '_M'; leaving kind/evaluates empty")
         df = df.with_columns(pl.lit(None, dtype=pl.String)
                              .alias(c) for c in
                              ("kind", "evaluates", "evaluates_method"))
